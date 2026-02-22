@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Perfect Pitch Challenge</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #1a1a2e;
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+        }
+        #gameCanvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        #ui {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none; /* Deja pasar los clicks al canvas si es necesario */
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        #top-bar {
+            padding: 20px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        #debug {
+            font-size: 16px;
+            color: #4cd137;
+        }
+        #start-screen, #game-over-screen {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background-color: rgba(26, 26, 46, 0.9);
+            pointer-events: auto;
+            z-index: 10;
+        }
+        button {
+            padding: 15px 30px;
+            font-size: 20px;
+            background-color: #e84118;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            margin-top: 20px;
+        }
+        button:hover { background-color: #c23616; }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div id="top-bar">
+            <div>Puntuación: <span id="score">0</span></div>
+            <div id="debug">Hz: <span id="freq">0</span> | Nota: <span id="note">-</span></div>
+        </div>
+    </div>
+
+    <div id="start-screen">
+        <h1>Pitch Challenge</h1>
+        <p>Usa tu voz para subir y bajar la bolita.</p>
+        <p>Notas graves = Abajo | Notas agudas = Arriba</p>
+        <button id="start-btn">Permitir Micrófono y Jugar</button>
+    </div>
+
+    <div id="game-over-screen" class="hidden">
+        <h1>¡Game Over!</h1>
+        <p>Puntuación final: <span id="final-score">0</span></p>
+        <button id="restart-btn">Volver a Intentar</button>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        // --- CONFIGURACIÓN DEL JUEGO ---
+        const MIN_FREQ = 100; // Hz (Voz grave)
+        const MAX_FREQ = 600; // Hz (Voz aguda)
+        const WALL_SPEED = 4;
+        const GAP_SIZE = 150;
+        const BALL_RADIUS = 15;
+
+        // --- VARIABLES GLOBALES ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        let audioCtx, analyser, microphone;
+        let dataArray;
+        let gameLoopId;
+        let isPlaying = false;
+
+        let score = 0;
+        let currentPitch = 0;
+        
+        let player = { x: 150, y: canvas.height / 2, targetY: canvas.height / 2 };
+        let walls = [];
+        let frames = 0;
+
+        // --- ELEMENTOS UI ---
+        const startScreen = document.getElementById('start-screen');
+        const gameOverScreen = document.getElementById('game-over-screen');
+        const scoreEl = document.getElementById('score');
+        const finalScoreEl = document.getElementById('final-score');
+        const freqEl = document.getElementById('freq');
+        const noteEl = document.getElementById('note');
+
+        // Notas musicales para el debug
+        const notes = ["Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si"];
+
+        // --- AUDIO Y DETECCIÓN DE TONO (AUTOCORRELACIÓN) ---
+        async function initAudio() {
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                microphone = audioCtx.createMediaStreamSource(stream);
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 2048;
+                microphone.connect(analyser);
+                dataArray = new Float32Array(analyser.fftSize);
+                startGame();
+            } catch (err) {
+                alert("Error al acceder al micrófono. Por favor, da permisos.");
+                console.error(err);
+            }
+        }
+
+        // Algoritmo de Autocorrelación para encontrar la frecuencia fundamental
+        function autoCorrelate(buf, sampleRate) {
+            let SIZE = buf.length;
+            let rms = 0;
+            for (let i = 0; i < SIZE; i++) {
+                let val = buf[i];
+                rms += val * val;
+            }
+            rms = Math.sqrt(rms / SIZE);
+            if (rms < 0.01) return -1; // No hay suficiente volumen
+
+            let r1 = 0, r2 = SIZE - 1, thres = 0.2;
+            for (let i = 0; i < SIZE / 2; i++)
+                if (Math.abs(buf[i]) < thres) { r1 = i; break; }
+            for (let i = 1; i < SIZE / 2; i++)
+                if (Math.abs(buf[SIZE - i]) < thres) { r2 = SIZE - i; break; }
+
+            buf = buf.slice(r1, r2);
+            SIZE = buf.length;
+
+            let c = new Array(SIZE).fill(0);
+            for (let i = 0; i < SIZE; i++)
+                for (let j = 0; j < SIZE - i; j++)
+                    c[i] = c[i] + buf[j] * buf[j + i];
+
+            let d = 0; while (c[d] > c[d + 1]) d++;
+            let maxval = -1, maxpos = -1;
+            for (let i = d; i < SIZE; i++) {
+                if (c[i] > maxval) {
+                    maxval = c[i];
+                    maxpos = i;
+                }
+            }
+            let T0 = maxpos;
+            let x1 = c[T0 - 1], x2 = c[T0], x3 = c[T0 + 1];
+            let a = (x1 + x3 - 2 * x2) / 2;
+            let b = (x3 - x1) / 2;
+            if (a) T0 = T0 - b / (2 * a);
+
+            return sampleRate / T0;
+        }
+
+        function updatePitch() {
+            analyser.getFloatTimeDomainData(dataArray);
+            let pitch = autoCorrelate(dataArray, audioCtx.sampleRate);
+            
+            if (pitch !== -1 && pitch >= MIN_FREQ && pitch <= MAX_FREQ) {
+                currentPitch = pitch;
+                freqEl.innerText = Math.round(pitch);
+                
+                // Calcular nota musical
+                let noteNum = 12 * (Math.log(pitch / 440) / Math.log(2));
+                let noteString = notes[(Math.round(noteNum) + 69) % 12];
+                noteEl.innerText = noteString;
+
+                // Mapear frecuencia a posición Y (Invertido: grave abajo, agudo arriba)
+                let normalizedPitch = (pitch - MIN_FREQ) / (MAX_FREQ - MIN_FREQ);
+                // Clamp entre 0 y 1
+                normalizedPitch = Math.max(0, Math.min(1, normalizedPitch));
+                player.targetY = canvas.height - (normalizedPitch * canvas.height);
+            }
+        }
+
+        // --- LÓGICA DEL JUEGO ---
+        function startGame() {
+            startScreen.classList.add('hidden');
+            gameOverScreen.classList.add('hidden');
+            score = 0;
+            walls = [];
+            frames = 0;
+            scoreEl.innerText = score;
+            player.y = canvas.height / 2;
+            isPlaying = true;
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            gameLoop();
+        }
+
+        function gameOver() {
+            isPlaying = false;
+            cancelAnimationFrame(gameLoopId);
+            finalScoreEl.innerText = score;
+            gameOverScreen.classList.remove('hidden');
+        }
+
+        function spawnWall() {
+            let gapY = Math.random() * (canvas.height - GAP_SIZE - 100) + 50; // Evitar bordes extremos
+            walls.push({
+                x: canvas.width,
+                y: gapY,
+                width: 50,
+                passed: false
+            });
+        }
+
+        function update() {
+            if (!isPlaying) return;
+
+            updatePitch();
+
+            // Suavizar el movimiento de la bolita (Lerp)
+            player.y += (player.targetY - player.y) * 0.1;
+            
+            // Limitar la bolita a la pantalla
+            if (player.y < BALL_RADIUS) player.y = BALL_RADIUS;
+            if (player.y > canvas.height - BALL_RADIUS) player.y = canvas.height - BALL_RADIUS;
+
+            // Mover muros
+            for (let i = 0; i < walls.length; i++) {
+                let w = walls[i];
+                w.x -= WALL_SPEED;
+
+                // Colisión
+                let hitX = player.x + BALL_RADIUS > w.x && player.x - BALL_RADIUS < w.x + w.width;
+                let hitYTop = player.y - BALL_RADIUS < w.y;
+                let hitYBottom = player.y + BALL_RADIUS > w.y + GAP_SIZE;
+
+                if (hitX && (hitYTop || hitYBottom)) {
+                    gameOver();
+                }
+
+                // Puntuación
+                if (w.x + w.width < player.x && !w.passed) {
+                    score++;
+                    scoreEl.innerText = score;
+                    w.passed = true;
+                }
+            }
+
+            // Eliminar muros fuera de pantalla
+            if (walls.length > 0 && walls[0].x < -50) {
+                walls.shift();
+            }
+
+            // Generar nuevos muros
+            if (frames % 120 === 0) { // Cada ~2 segundos a 60fps
+                spawnWall();
+            }
+
+            frames++;
+        }
+
+        function draw() {
+            // Limpiar fondo
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Dibujar muros
+            ctx.fillStyle = '#00a8ff';
+            for (let i = 0; i < walls.length; i++) {
+                let w = walls[i];
+                // Muro superior
+                ctx.fillRect(w.x, 0, w.width, w.y);
+                // Muro inferior
+                ctx.fillRect(w.x, w.y + GAP_SIZE, w.width, canvas.height - (w.y + GAP_SIZE));
+            }
+
+            // Dibujar jugador
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, BALL_RADIUS, 0, Math.PI * 2);
+            ctx.fillStyle = '#fbc531';
+            ctx.fill();
+            ctx.closePath();
+            
+            // Brillo de la bolita
+            ctx.beginPath();
+            ctx.arc(player.x - 4, player.y - 4, BALL_RADIUS / 3, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+            ctx.fill();
+            ctx.closePath();
+        }
+
+        function gameLoop() {
+            update();
+            draw();
+            if (isPlaying) {
+                gameLoopId = requestAnimationFrame(gameLoop);
+            }
+        }
+
+        // --- EVENTOS ---
+        document.getElementById('start-btn').addEventListener('click', initAudio);
+        document.getElementById('restart-btn').addEventListener('click', startGame);
+
+        window.addEventListener('resize', () => {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        });
+    </script>
+</body>
+</html>
